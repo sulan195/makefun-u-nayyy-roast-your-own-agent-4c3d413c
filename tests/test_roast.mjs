@@ -46,6 +46,21 @@ test("validateLine rejects the Fase 2 edge cases", () => {
   assert.throws(() => validateLine(" padded "), /whitespace/);
   assert.throws(() => validateLine("two\nlines"), /single line/);
   assert.throws(() => validateLine("carriage\rreturn"), /single line/);
+  // Whitespace-only strings are covered by the gate's "not only whitespace"
+  // rule even though they are inside the 1-200 length range.
+  assert.throws(() => validateLine("   "), /whitespace/);
+  assert.throws(() => validateLine("\t"), /control|whitespace/);
+  assert.throws(() => validateLine(" x"), /whitespace/);
+  assert.throws(() => validateLine("x "), /whitespace/);
+  // Interior tab and Unicode line/paragraph separators.
+  assert.throws(() => validateLine("a\tb"), /control/);
+  assert.throws(() => validateLine("a\u2028b"), /control/);
+  // A lone surrogate passes length checks but writeFileSync would silently
+  // substitute U+FFFD for it, so the validator must reject it.
+  assert.throws(() => validateLine("a\uD800b"), /well-formed/);
+  // Inclusive pass boundaries: 1 char and exactly 200 chars/bytes.
+  validateLine("x");
+  validateLine("x".repeat(200));
   // 201 bytes of 2-byte characters is 101 chars: inside the char gate but
   // over the byte cap the entry enforces for the Size tie-break.
   assert.throws(() => validateLine("é".repeat(101)), /200 bytes/);
@@ -58,6 +73,10 @@ test("outputDir prefers MAKEFUN_OUTPUT_DIR, falls back to /output", () => {
     assert.equal(outputDir(), "/tmp/somewhere");
     process.env.MAKEFUN_OUTPUT_DIR = "   ";
     assert.equal(outputDir(), "/output");
+    process.env.MAKEFUN_OUTPUT_DIR = "";
+    assert.equal(outputDir(), "/output");
+    process.env.MAKEFUN_OUTPUT_DIR = "  /tmp/padded  ";
+    assert.equal(outputDir(), "/tmp/padded");
     delete process.env.MAKEFUN_OUTPUT_DIR;
     assert.equal(outputDir(), "/output");
   } finally {
@@ -76,7 +95,59 @@ test("writeEntry creates a missing output dir and writes exactly the line", () =
     assert.equal(bytes.toString("utf8"), ROAST);
     assert.equal(bytes.length, Buffer.byteLength(ROAST, "utf8"));
     assert.ok(!bytes.toString("utf8").endsWith("\n"), "no trailing newline");
-    assert.ok(!bytes.toString("utf8").startsWith("﻿"), "no BOM");
+    assert.ok(!(bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf), "no BOM");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeEntry overwrites a stale longer entry.txt and treats empty dir as fallback", () => {
+  const dir = tempDir();
+  const saved = process.env.MAKEFUN_OUTPUT_DIR;
+  try {
+    // Stale longer file: the write must truncate, not append or leave bytes.
+    const stale = join(dir, "entry.txt");
+    execFileSync("node", ["-e", `require("fs").writeFileSync(${JSON.stringify(stale)}, "x".repeat(500))`], { stdio: "pipe" });
+    writeEntry(dir);
+    assert.equal(readFileSync(stale, "utf8"), ROAST);
+    // Empty / whitespace-only dir falls back to the env directory.
+    process.env.MAKEFUN_OUTPUT_DIR = dir;
+    assert.equal(writeEntry(""), join(dir, "entry.txt"));
+    assert.equal(writeEntry("   "), join(dir, "entry.txt"));
+    assert.equal(readFileSync(stale, "utf8"), ROAST);
+  } finally {
+    if (saved === undefined) delete process.env.MAKEFUN_OUTPUT_DIR;
+    else process.env.MAKEFUN_OUTPUT_DIR = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("harness run works as relative 'node main.ts' from the repo root", () => {
+  const dir = tempDir();
+  try {
+    const out = join(dir, "out");
+    const repoRoot = join(MAIN, "..");
+    execFileSync("node", ["main.ts"], {
+      cwd: repoRoot,
+      env: { ...process.env, MAKEFUN_OUTPUT_DIR: out },
+      stdio: "pipe",
+    });
+    assert.equal(readFileSync(join(out, "entry.txt"), "utf8"), ROAST);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("harness run works with an absolute path from an unrelated cwd", () => {
+  const dir = tempDir();
+  try {
+    const out = join(dir, "out");
+    execFileSync("node", [MAIN], {
+      cwd: dir,
+      env: { ...process.env, MAKEFUN_OUTPUT_DIR: out },
+      stdio: "pipe",
+    });
+    assert.equal(readFileSync(join(out, "entry.txt"), "utf8"), ROAST);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
